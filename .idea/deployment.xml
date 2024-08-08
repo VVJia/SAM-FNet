@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="pro@10.14.3.179:22 password (2)" remoteFilesAllowedToDisappearOnAutoupload="false">
+    <serverData>
+      <paths name="pro@10.14.3.179:22 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/pro/SAM-FNet" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="pro@10.14.3.179:22 password (2)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/pro/SAM-FNet" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>
