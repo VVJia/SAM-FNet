@@ -64,7 +64,6 @@ def logsumexp_2d(tensor):
     outputs = s + (tensor_flatten - s).exp().sum(dim=2, keepdim=True).log()
     return outputs
 
-
 class ChannelPool(nn.Module):
     def forward(self, x):
         return torch.cat((torch.max(x,1)[0].unsqueeze(1), torch.mean(x,1).unsqueeze(1)), dim=1)

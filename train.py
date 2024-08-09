@@ -11,7 +11,7 @@ import random
 from torch import optim
 from torch.utils.data import DataLoader
 from dataset import LPCDataset
-from model import SAM_FNet50
+from model import SAM_FNet18, SAM_FNet34, SAM_FNet50
 import time
 from tqdm import tqdm
 from torch.nn.parallel import DataParallel
@@ -22,13 +22,24 @@ from torch.utils.tensorboard import SummaryWriter
 
 import os
 
-def classacc(predicted, label):
-    acc = label.float()+predicted.float()
-    acc_normal = (acc == 0).sum().float()
-    acc_tumor = (acc == 4).sum().float()
-    acc_temp = label.float()*predicted.float()
-    acc_benign = (acc_temp == 1).sum().float()
-    return acc_normal, acc_benign, acc_tumor
+def classacc(predicted, label, num_classes=3):
+    """
+    Calculate the accuracy for each class.
+
+    Args:
+        predicted (torch.Tensor): The predicted class labels.
+        label (torch.Tensor): The ground truth class labels.
+        num_classes (int): The number of classes. Default is 3 (Normal, Benign, Tumor).
+
+    Returns:
+        List[torch.Tensor]: A list containing the accuracy for each class.
+    """
+    acc = []
+    for cls in range(num_classes):
+        acc_class = ((label == cls) & (predicted == cls)).sum().float()
+        acc.append(acc_class)
+
+    return acc
 
 def cal_loss(args, criterion, m1, m2, c1, c2, outputs, features, labels, target1, target2, epoch):
     # GAN-like Loss
@@ -58,7 +69,7 @@ def cal_loss(args, criterion, m1, m2, c1, c2, outputs, features, labels, target1
         loss1 = loss2 = 0
 
     # cross-entropy loss - global, local, and fusion
-    loss3 = criterion['fc'](outputs, labels) if args.Focal else criterion['ce'](outputs, labels)
+    loss3 = criterion['ce'](outputs, labels)
     loss4 = criterion['ce'](c1, labels)
     loss5 = criterion['ce'](c2, labels)
 
@@ -70,7 +81,7 @@ def cal_loss(args, criterion, m1, m2, c1, c2, outputs, features, labels, target1
 
     return loss1, loss2, loss3, loss4, loss5, loss
 
-def train_model(args, model, criterion, train_dataloaders, val_dataloaders, num_epochs, model_path, writer, writer_):
+def train_model(args, model, criterion, train_dataloaders, val_dataloaders, num_epochs, model_path, writer):
     if args.warmup:
         b_lr = args.lr / args.warmup_period
     else:
@@ -98,17 +109,11 @@ def train_model(args, model, criterion, train_dataloaders, val_dataloaders, num_
         epoch_global_loss = 0.0
         epoch_fusion_loss = 0.0
 
-        step = 0
-        correct = 0.0
-        correct_normal = 0.0
-        correct_benign = 0.0
-        correct_tumor = 0.0
-        total = 0.0
-        total_normal = 0.0
-        total_benign = 0.0
-        total_tumor = 0.0
+        # Initialize dictionaries for correct predictions and total counts
+        correct = {cls: 0.0 for cls in range(args.num_classes)}
+        total = {cls: 0.0 for cls in range(args.num_classes)}
+
         for idx, (input1, input2, labels, target1, target2) in tqdm(enumerate(train_dataloaders), total=len(train_dataloaders)):   # 这边一次取出一个batchsize的东西
-            step += 1
             input1, input2, labels, target1, target2 = \
                 input1.cuda(), input2.cuda(), labels.cuda(), target1.cuda(), target2.cuda()
             with amp.autocast():
@@ -129,15 +134,10 @@ def train_model(args, model, criterion, train_dataloaders, val_dataloaders, num_
             epoch_fusion_loss += loss3.item()*current_batchsize
 
             _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            correct_normal_temp, correct_benign_temp, correct_tumor_temp = classacc(predicted, labels)
-            correct_normal += correct_normal_temp
-            correct_benign += correct_benign_temp
-            correct_tumor += correct_tumor_temp
-            total_normal += (labels == 0).sum().float()
-            total_benign += (labels == 1).sum().float()
-            total_tumor += (labels == 2).sum().float()
+            acc_temp = classacc(predicted, labels, args.num_classes)
+            for cls in range(args.num_classes):
+                correct[cls] += acc_temp[cls]
+                total[cls] += (labels == cls).sum().float()
 
             if args.warmup and iter_num < args.warmup_period:
                 lr_ = args.lr * ((iter_num + 1) / args.warmup_period)
@@ -154,55 +154,49 @@ def train_model(args, model, criterion, train_dataloaders, val_dataloaders, num_
                     param_group['lr'] = lr_
 
             iter_num = iter_num + 1
-            writer.add_scalar('info/lr', lr_, iter_num)
-            writer.add_scalar('info/total_loss', loss, iter_num)
-            writer.add_scalar('info/loss_cos', loss1, iter_num)
-            writer.add_scalar('info/loss_dis', loss2, iter_num)
-            writer.add_scalar('info/loss_ce_global', loss4, iter_num)
-            writer.add_scalar('info/loss_ce_local', loss5, iter_num)
-            writer.add_scalar('info/loss_ce_fusion', loss3, iter_num)
 
-        epochmean = epoch_loss/total
+        correct_total = sum(correct.values())
+        sum_total = sum(total.values())
+
+        epochmean = epoch_loss/sum_total
         if epoch > args.gan_epoch and args.gan_opt:
-            epoch_cos_mean = epoch_cos_loss/total
-            epoch_dis_mean = epoch_dis_loss/total
+            epoch_cos_mean = epoch_cos_loss/sum_total
+            epoch_dis_mean = epoch_dis_loss/sum_total
+        epoch_global_mean = epoch_global_loss/sum_total
+        epoch_local_mean = epoch_local_loss/sum_total
+        epoch_fusion_mean = epoch_fusion_loss/sum_total
 
-        epoch_global_mean = epoch_global_loss/total
-        epoch_local_mean = epoch_local_loss/total
-        epoch_fusion_mean = epoch_fusion_loss/total
-        acc_normal = correct_normal/total_normal
-        acc_benign = correct_benign/total_benign
-        acc_tumor = correct_tumor/total_tumor
-        acc_class_mean = (acc_normal + acc_benign + acc_tumor)/3.0
-        acc_mean = correct/total
-        print("train_loss_mean_%d"%epoch, epochmean)
+        recall_classes = {cls: correct[cls]/total[cls] for cls in range(args.num_classes)}
+        recall_mean = correct_total/3.0
+        acc_mean = correct_total/sum_total
+
+        print(f"train_loss_mean_{epoch}: {epochmean:.4f}")
         if (epoch > args.gan_epoch) and args.gan_opt:
-            print("train_cos_loss_mean_%d" % epoch, epoch_cos_mean)
-            print("train_dis_loss_mean_%d" % epoch, epoch_dis_mean)
+            print(f"train_cos_loss_mean_{epoch}: {epoch_cos_mean:.4f}")
+            print(f"train_dis_loss_mean_{epoch}: {epoch_dis_mean:.4f}")
 
-        print("train_global_loss_%d" % epoch, epoch_global_mean)
-        print("train_local_loss_%d" % epoch, epoch_local_mean)
-        print("train_fusion_loss_%d" % epoch, epoch_fusion_mean)
-        print("train_acc_normal_mean_%d"%epoch, acc_normal)
-        print("train_acc_benign_mean_%d"%epoch, acc_benign)
-        print("train_acc_tumor_mean_%d"%epoch, acc_tumor)
-        print("train_acc_class_mean_%d"%epoch, acc_class_mean)
-        print("train_acc_mean_%d"%epoch, acc_mean)
+        print(f"train_global_loss_{epoch}: {epoch_global_mean:.4f}")
+        print(f"train_local_loss_{epoch}: {epoch_local_mean:.4f}")
+        print(f"train_fusion_loss_{epoch}: {epoch_fusion_mean:.4f}")
+
+        for cls in range(args.num_classes):
+            print(f"train_recall_class_{cls}_{epoch}: {recall_classes[cls]:.4f}")
+        print(f"train_recall_class_mean_{epoch}: {recall_mean:.4f}")
+        print(f"train_acc_{epoch}: {acc_mean:.4f}")
 
         ## tensorboard
-        writer.add_scalar("loss", epochmean, epoch)
+        writer.add_scalar("train/loss", epochmean, epoch)
         if epoch > args.gan_epoch and args.gan_opt:
-            writer.add_scalar("cos_loss", epoch_cos_mean, epoch)
-            writer.add_scalar("dis_loss", epoch_dis_mean, epoch)
+            writer.add_scalar("train/cos_loss", epoch_cos_mean, epoch)
+            writer.add_scalar("train/dis_loss", epoch_dis_mean, epoch)
+        writer.add_scalar("train/global_loss", epoch_global_mean, epoch)
+        writer.add_scalar("train/local_loss", epoch_local_mean, epoch)
+        writer.add_scalar("train/fusion_loss", epoch_fusion_mean, epoch)
 
-        writer.add_scalar("global_loss", epoch_global_mean, epoch)
-        writer.add_scalar("local_loss", epoch_local_mean, epoch)
-        writer.add_scalar("fusion_loss", epoch_fusion_mean, epoch)
-        writer.add_scalar("acc_normal", acc_normal, epoch)
-        writer.add_scalar("acc_benign", acc_benign, epoch)
-        writer.add_scalar("acc_tumor", acc_tumor, epoch)
-        writer.add_scalar("acc_class_mean", acc_class_mean, epoch)
-        writer.add_scalar("acc_mean", acc_mean, epoch)
+        for cls in range(args.num_classes):
+            writer.add_scalar(f"train/recall_{cls}", recall_classes[cls], epoch)
+        writer.add_scalar("train/recall_mean", recall_mean, epoch)
+        writer.add_scalar("train/acc", acc_mean, epoch)
 
         # ---------------------- validating --------------------------
         model.eval()
@@ -213,17 +207,11 @@ def train_model(args, model, criterion, train_dataloaders, val_dataloaders, num_
             epoch_cos_loss_val = 0.0
             epoch_dis_loss_val = 0.0
             epoch_fusion_loss_val = 0.0
-            step_val = 0
-            correct = 0.0
-            correct_normal = 0.0
-            correct_benign = 0.0
-            correct_tumor = 0.0
-            total = 0.0
-            total_normal = 0.0
-            total_benign = 0.0
-            total_tumor = 0.0
+
+            correct = {cls: 0.0 for cls in range(args.num_classes)}
+            total = {cls: 0.0 for cls in range(args.num_classes)}
+
             for idx, (input1, input2, labels, target1, target2) in tqdm(enumerate(val_dataloaders), total=len(val_dataloaders)):
-                step_val += 1
                 input1, input2, labels, target1, target2 = \
                     input1.cuda(), input2.cuda(), labels.cuda(), target1.cuda(), target2.cuda()
                 c1, c2, outputs, m1, m2, features = model(input1, input2, labels)
@@ -239,72 +227,67 @@ def train_model(args, model, criterion, train_dataloaders, val_dataloaders, num_
                 epoch_fusion_loss_val += loss3.item()*current_batchsize
 
                 _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-                correct_normal_temp, correct_benign_temp, correct_tumor_temp = classacc(predicted, labels)
-                correct_normal += correct_normal_temp
-                correct_benign += correct_benign_temp
-                correct_tumor += correct_tumor_temp
-                total_normal += (labels == 0).sum().float()
-                total_benign += (labels == 1).sum().float()
-                total_tumor += (labels == 2).sum().float()
+                acc_temp = classacc(predicted, labels, args.num_classes)
+                for cls in range(args.num_classes):
+                    correct[cls] += acc_temp[cls]
+                    total[cls] += (labels == cls).sum().float()
 
-            epochmean_val = epoch_loss_val/total
+            correct_total = sum(correct.values())
+            sum_total = sum(total.values())
+
+            epochmean_val = epoch_loss_val/sum_total
             if epoch > args.gan_epoch and args.gan_opt:
-                epochmean_cos_val = epoch_cos_loss_val/total
-                epochmean_dis_val = epoch_dis_loss_val/total
+                epochmean_cos_val = epoch_cos_loss_val/sum_total
+                epochmean_dis_val = epoch_dis_loss_val/sum_total
+            epochmean_global_val = epoch_glabol_loss_val / sum_total
+            epochmean_local_val = epoch_local_loss_val / sum_total
+            epochmean_fusion_val = epoch_fusion_loss_val / sum_total
 
-            epochmean_global_val = epoch_glabol_loss_val / total
-            epochmean_local_val = epoch_local_loss_val / total
-            epochmean_fusion_val = epoch_fusion_loss_val / total
-            acc_normal_val = correct_normal/total_normal
-            acc_benign_val = correct_benign/total_benign
-            acc_tumor_val = correct_tumor/total_tumor
-            acc_class_mean_val = (acc_normal_val + acc_benign_val + acc_tumor_val)/3.0
-            acc_mean_val = correct/total
-            print("val_loss_mean_%d"%epoch, epochmean_val)
+            recall_classes = {cls: correct[cls] / total[cls] for cls in range(args.num_classes)}
+            recall_mean = correct_total / 3.0
+            acc_mean = correct_total / sum_total
+
+            print(f"val_loss_mean_{epoch}: {epochmean_val:.4f}")
             if (epoch > args.gan_epoch) and args.gan_opt:
-                print("val_cos_loss_mean_%d" % epoch, epochmean_cos_val)
-                print("val_dis_loss_mean_%d" % epoch, epochmean_dis_val)
+                print(f"val_cos_loss_mean_{epoch}: {epochmean_cos_val:.4f}")
+                print(f"val_dis_loss_mean_{epoch}: {epochmean_dis_val:.4f}")
+            print(f"val_global_loss_{epoch}: {epochmean_global_val:.4f}")
+            print(f"val_local_loss_{epoch}: {epochmean_local_val:.4f}")
+            print(f"val_fusion_loss_{epoch}: {epochmean_fusion_val:.4f}")
 
-            print("val_global_loss_mean_%d" % epoch, epochmean_global_val)
-            print("val_local_loss_mean_%d" % epoch, epochmean_local_val)
-            print("val_fusion_loss_mean_%d" % epoch, epochmean_fusion_val)
-            print("val_acc_normal_mean_%d"%epoch, acc_normal_val)
-            print("val_acc_benign_mean_%d"%epoch, acc_benign_val)
-            print("val_acc_tumor_mean_%d"%epoch, acc_tumor_val)
-            print("val_acc_class_mean_%d"%epoch, acc_class_mean_val)
-            print("val_acc_mean_%d"%epoch, acc_mean_val)
+            for cls in range(args.num_classes):
+                print(f"val_recall_class_{cls}_{epoch}: {recall_classes[cls]:.4f}")
+            print(f"val_recall_class_mean_{epoch}: {recall_mean:.4f}")
+            print(f"val_acc_{epoch}: {acc_mean:.4f}")
 
             ## tensorboard
-            writer_.add_scalar("loss", epochmean_val, epoch)
+            writer.add_scalar("val/loss", epochmean_val, epoch)
             if epoch > args.gan_epoch and args.gan_opt:
-                writer_.add_scalar("cos_loss", epochmean_cos_val, epoch)
-                writer_.add_scalar("dis_loss", epochmean_dis_val, epoch)
+                writer.add_scalar("val/cos_loss", epochmean_cos_val, epoch)
+                writer.add_scalar("val/dis_loss", epochmean_dis_val, epoch)
+            writer.add_scalar("val/global_loss", epochmean_global_val, epoch)
+            writer.add_scalar("val/local_loss", epochmean_local_val, epoch)
+            writer.add_scalar("val/fusion_loss", epochmean_fusion_val, epoch)
 
-            writer_.add_scalar("global_loss", epochmean_global_val, epoch)
-            writer_.add_scalar("local_loss", epochmean_local_val, epoch)
-            writer_.add_scalar("fusion_loss", epochmean_fusion_val, epoch)
-            writer_.add_scalar("acc_normal", acc_normal_val, epoch)
-            writer_.add_scalar("acc_benign", acc_benign_val, epoch)
-            writer_.add_scalar("acc_tumor", acc_tumor_val, epoch)
-            writer_.add_scalar("acc_class_mean", acc_class_mean_val, epoch)
-            writer_.add_scalar("acc_mean", acc_mean_val, epoch)
+            for cls in range(args.num_classes):
+                writer.add_scalar(f"val/recall_{cls}", recall_classes[cls], epoch)
+            writer.add_scalar("val/recall_mean", recall_mean, epoch)
+            writer.add_scalar("val/acc", acc_mean, epoch)
 
-            if acc_mean_val*0.1 + acc_class_mean_val*0.9 > best_val_acc:
-                best_val_acc = acc_mean_val*0.1 + acc_class_mean_val * 0.9
-                torch.save(model.module.state_dict(), model_path / '{}_{}.pth'.format(epoch, best_val_acc))
+            if acc_mean*0.1 + recall_mean*0.9 > best_val_acc:
+                best_val_acc = acc_mean*0.1 + recall_mean*0.9
+
+                # If using DP
+                if torch.cuda.device_count() > 1:
+                    torch.save(model.module.state_dict(), model_path / '{}_{:.4f}.pth'.format(epoch, best_val_acc))
+                else:
+                    torch.save(model.state_dict(), model_path / '{}_{:.4f}.pth'.format(epoch, best_val_acc))
 
             print("%2.2f sec(s)"%(time.time() - epoch_start_time))
 
-        torch.cuda.empty_cache()
-        if (epoch % 5 == 0 or epoch == num_epochs - 1):  # 每隔5轮存一下
+        # interval of saving model
+        if (epoch % args.interval == 0 or epoch == num_epochs - 1):
             torch.save(model.module.state_dict(), model_path / '{}.pth'.format(epoch))
-
-    writer.close()
-    writer_.close()
-
-    return model
 
 # Fix random seed for reproducibility
 def same_seeds(seed):
@@ -318,16 +301,16 @@ def same_seeds(seed):
     torch.backends.cudnn.deterministic = True
 
 
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str,
-                        default='./datasets/dataset1/global/train')
+    parser.add_argument('--data_dir', type=str, default='./datasets/dataset1/global/train')
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--img_size', type=int, default=256)
     parser.add_argument('--epoch', type=int, default=60)
+    parser.add_argument("--num_classes", type=int, default=3)
 
-    parser.add_argument('--gan_opt', action='store_true')
-    parser.add_argument('--gan_epoch', type=int, default=10)
+    parser.add_argument("--gan_opt", type=bool, default=False)
+    parser.add_argument('--gan_epoch', type=int, default=10, help='epoch to start calculating GAN-like loss')
     parser.add_argument('--gan_weight', type=float, default=0.01)
 
     parser.add_argument('--AdamW', action='store_true')
@@ -339,8 +322,13 @@ if __name__ == '__main__':
     parser.add_argument('--local_weight', type=float, default=0.3)
     parser.add_argument('--fusion_weight', type=float, default=1.0)
 
+    parser.add_argument("--pretrained", type=bool, default=True, help="whether to use pretrained models")
+    parser.add_argument('--encoder', type=str, default='ResNet50', help="encoder name",
+                        choices=['ResNet18', 'ResNet34', 'ResNet50'])
+
     parser.add_argument('--save_path', type=str, default='./model_ours')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--interval', type=int, default=5, help='interval of saving model during training')
     parser.add_argument('--devices', type=str, default="0, 1")
 
     args = parser.parse_args()
@@ -359,39 +347,50 @@ if __name__ == '__main__':
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.devices
 
-
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-
     same_seeds(args.seed)
-    model = SAM_FNet50(num_classes=3, num_features=2)
-    model = DataParallel(model)
-    model.cuda()
-    criterion = {}
-    criterion['ce'] = nn.CrossEntropyLoss()
-    if args.gan_opt:
-        criterion['cs'] = nn.CosineEmbeddingLoss()
-        criterion['be'] = nn.BCEWithLogitsLoss(reduction='none')
-    transforms_train = transforms.Compose([
-        transforms.RandomAffine(degrees=10, scale=(0.9, 1.1), translate=(0.1, 0.1), shear=5.729578),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(0.4, 0.4, 0.4, 0),
-        transforms.Resize(args.img_size),
-        transforms.CenterCrop(args.img_size),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
 
-    transforms_val = transforms.Compose([
-        transforms.Resize(args.img_size),
-        transforms.CenterCrop(args.img_size),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
+    # num_features is fixed, representing the number of branches (global and local)
+    if args.encoder == 'ResNet18':
+        model = SAM_FNet18(num_classes=args.num_classes, num_features=2, pretrained=args.pretrained)
+    elif args.encoder == 'ResNet34':
+        model = SAM_FNet34(num_classes=args.num_classes, num_features=2, pretrained=args.pretrained)
+    elif args.encoder == 'ResNet50':
+        model = SAM_FNet50(num_classes=args.num_classes, num_features=2, pretrained=args.pretrained)
+    model = model.cuda()
+    if torch.cuda.device_count() > 1:
+        model = DataParallel(model)
 
-    train_dataset = LPCDataset(root = args.data_dir, transform = transforms_train)
+    criterion = {
+        # classification loss for global, local, and fusion
+        'ce': nn.CrossEntropyLoss(),
+
+        # GAN-like loss
+        'cs': nn.CosineEmbeddingLoss(),
+        'be': nn.BCEWithLogitsLoss(reduction='none')
+    }
+
+    data_transform = {
+        'train': transforms.Compose([
+            transforms.RandomAffine(degrees=10, scale=(0.9, 1.1), translate=(0.1, 0.1), shear=5.729578),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(0.4, 0.4, 0.4, 0),
+            transforms.Resize(args.img_size),
+            transforms.CenterCrop(args.img_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]),
+
+        'val': transforms.Compose([
+            transforms.Resize(args.img_size),
+            transforms.CenterCrop(args.img_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+    }
+
+
+    train_dataset = LPCDataset(root = args.data_dir, transform = data_transform['train'])
     print('The length of training dataset:', len(train_dataset))
     train_dataloaders = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
-    val_dataset = LPCDataset(root = args.data_dir.replace('train', 'val'), transform = transforms_val)
+    val_dataset = LPCDataset(root = args.data_dir.replace('train', 'val'), transform = data_transform['val'])
     print('The length of validating dataset:', len(val_dataset))
     val_dataloaders = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=8, pin_memory=True)
 
@@ -399,6 +398,8 @@ if __name__ == '__main__':
     model_path = save / 'weights'
     record_path.mkdir(parents=True, exist_ok=True)
     model_path.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter((record_path / 'train').as_posix())
-    writer_ = SummaryWriter((record_path / 'val').as_posix())
-    train_model(args, model, criterion, train_dataloaders, val_dataloaders, args.epoch, model_path, writer, writer_)
+    writer = SummaryWriter(record_path.as_posix())
+    train_model(args, model, criterion, train_dataloaders, val_dataloaders, args.epoch, model_path, writer)
+
+if __name__ == '__main__':
+    main()

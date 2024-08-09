@@ -1,3 +1,4 @@
+import os
 import argparse
 import multiprocessing
 multiprocessing.set_start_method("spawn", True)
@@ -8,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from model import SAM_FNet50
+from model import SAM_FNet50, SAM_FNet18, SAM_FNet34
 from torchvision import transforms
 from dataset import LPCDataset
 from tqdm import tqdm
@@ -24,10 +25,9 @@ classes = {
 }
 
 def count_metrics(plist, tlist, save_path):
-    # target_names = ['normal', 'benign', 'tumor']
     pred_np = np.array(plist)
     targets_np = np.array(tlist)
-    #cm = confusion_matrix(targets_np, pred_np, labels=target_names)
+
     report = classification_report(targets_np, pred_np, digits=4)
     print(report)
 
@@ -74,15 +74,15 @@ def test(args, model, val_dataloaders, save_path):
 
         count_metrics(preds, targets, save_path)
 
-import os
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, default='./model_ours/weights/46_0.9646134376525879.pth')
+    parser.add_argument('--model_path', type=str, default='./model_ours/weights/46_0.9646.pth')
+    parser.add_argument('--encoder', type=str, default='ResNet50', help="encoder name",
+                        choices=['ResNet18', 'ResNet34', 'ResNet50'])
     parser.add_argument('--dataset', type=str, default='dataset1')
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--img_size', type=int, default=256)
-    parser.add_argument('--ensemble', action='store_true')
+    parser.add_argument('--ensemble', type=bool, default=True)
     parser.add_argument('--save_path', type=str, default='./model_ours/')
     parser.add_argument('--devices', type=str, default='0,1')
 
@@ -96,20 +96,23 @@ if __name__ == '__main__':
     if not save_path.exists():
         save_path.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-
-    model = SAM_FNet50(num_classes=3, num_features=2)
+    if args.encoder == 'ResNet18':
+        model = SAM_FNet18(num_classes=args.num_classes, num_features=2, pretrained=False)
+    elif args.encoder == 'ResNet34':
+        model = SAM_FNet34(num_classes=args.num_classes, num_features=2, pretrained=False)
+    elif args.encoder == 'ResNet50':
+        model = SAM_FNet50(num_classes=args.num_classes, num_features=2, pretrained=False)
     model.load_state_dict(torch.load(model_path))
-    model = model.to(device)
+    model = model.cuda()
 
-    batch_size = args.batch_size
     transforms_val = transforms.Compose([
         transforms.Resize(args.img_size),
         transforms.CenterCrop(args.img_size),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
+
     test_dataset = LPCDataset(root=f'./datasets/{args.dataset}/global/test', transform=transforms_val)
     print('The length of testing dataset', len(test_dataset))
-    test_dataloaders = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8)
+    test_dataloaders = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=8)
     test(args, model, test_dataloaders, save_path)

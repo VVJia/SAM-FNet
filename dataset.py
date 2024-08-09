@@ -4,24 +4,24 @@ import os
 import torch.utils.data as data
 from torch.utils.data import DataLoader
 
+class_labels = ['normal', 'benign', 'tumor']
 
 def make_dataset(path):
     imgs = []
-    img_types = ['normal', 'benign', 'tumor']
-    for i in range(3):
-        img_dir_path = os.path.join(path,img_types[i])
+    for i in range(len(class_labels)):
+        img_dir_path = os.path.join(path, class_labels[i])
         img_name = os.listdir(img_dir_path)
         for name in img_name:
-            img_path = os.path.join(img_dir_path,name)
-            crop_path = img_path.replace('global','local_seg')
+            img_path = os.path.join(img_dir_path, name)
+            crop_path = img_path.replace('global', 'local_seg')
             imgs.append((img_path, crop_path, i, name))
+
     return imgs
 
 
 class LPCDataset(data.Dataset):
     def __init__(self, root, transform=None):
-        imgs = make_dataset(root)
-        self.imgs = imgs
+        self.imgs = make_dataset(root)
         self.transform = transform
 
     def __getitem__(self, index):
@@ -33,6 +33,7 @@ class LPCDataset(data.Dataset):
             img_x = self.transform(img_x)
             crop_x = self.transform(crop_x)
 
+        # o for global features, 1 for local features
         return img_x, crop_x, label, 0, 1
 
     def __len__(self):
