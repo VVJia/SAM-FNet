@@ -44,7 +44,7 @@ def classacc(predicted, label, num_classes=3):
 def cal_loss(args, criterion, m1, m2, c1, c2, outputs, features, labels, target1, target2, epoch):
     # GAN-like Loss
     if (epoch > args.gan_epoch) and args.gan_opt:
-        idx = (labels == 1) | (labels == 2)
+        idx = labels != 0
         loss_flag = torch.zeros_like(labels).float().cuda()
         loss_flag[idx] = 1
         loss1 = criterion['cs'](features['global'], features['local'], loss_flag)
@@ -167,7 +167,7 @@ def train_model(args, model, criterion, train_dataloaders, val_dataloaders, num_
         epoch_fusion_mean = epoch_fusion_loss/sum_total
 
         recall_classes = {cls: correct[cls]/total[cls] for cls in range(args.num_classes)}
-        recall_mean = correct_total/3.0
+        recall_mean = sum(recall_classes.values())/3.0
         acc_mean = correct_total/sum_total
 
         print(f"train_loss_mean_{epoch}: {epochmean:.4f}")
@@ -244,7 +244,7 @@ def train_model(args, model, criterion, train_dataloaders, val_dataloaders, num_
             epochmean_fusion_val = epoch_fusion_loss_val / sum_total
 
             recall_classes = {cls: correct[cls] / total[cls] for cls in range(args.num_classes)}
-            recall_mean = correct_total / 3.0
+            recall_mean = sum(recall_classes.values()) / 3.0
             acc_mean = correct_total / sum_total
 
             print(f"val_loss_mean_{epoch}: {epochmean_val:.4f}")
